@@ -1,55 +1,104 @@
-using JSON3
+# src/server/server.jl
 using HTTP
+using JSON3
+using LinearAlgebra
 
-include("../physics/heat.jl");       using .HeatPhysics
-include("../solvers/fem_solver.jl"); using .FEMSolver
-include("websocket.jl");             using .WSServer
+include("../solvers/fem_solver.jl")
+include("../physics/heat.jl")
 
-function ws_handler(ws::HTTP.WebSockets.WebSocket)
-    println("[WS] Client connected")
-
-    try
-        for msg_raw in ws
-            msg  = JSON3.read(String(msg_raw))
-            type = get(msg, :type, "")
-            println("[WS] Received: ", type)
-
-            if type == "init"
-                α  = Float64(get(msg, :alpha, 0.1))
-                n  = Int(get(msg, :resolution, 32))
-                dt = Float64(get(msg, :dt, 0.01))
-                WSServer.solver_ref[] = FEMSolver.HeatSolver(α=α, n=n, dt=dt)
-                HTTP.WebSockets.send(ws, JSON3.write(Dict("type" => "ready")))
-                println("[WS] Solver initialized, sent ready")
-
-            elseif type == "step"
-                solver = WSServer.solver_ref[]
-                isnothing(solver) && continue
-                u_new, ms = FEMSolver.step!(solver)
-                grid = FEMSolver.to_grid(solver)
-                payload = Dict(
-                    "type"    => "frame",
-                    "step"    => solver.step,
-                    "time"    => solver.t,
-                    "solveMs" => ms,
-                    "grid"    => vec(grid),
-                    "n"       => solver.prob.n,
-                )
-                HTTP.WebSockets.send(ws, JSON3.write(payload))
-
-            elseif type == "reset"
-                WSServer.init_solver!()
-                HTTP.WebSockets.send(ws, JSON3.write(Dict("type" => "ready")))
-            end
-        end
-    catch e
-        println("[WS] Error: ", e)
-    end
-
-    println("[WS] Client disconnected")
+# Shared solver state
+mutable struct SimulationState
+    solver::Union{Nothing, HeatSolver}
+    params::Dict{String, Float64}
 end
 
-println("Starting PhysicsForge server on port 8080...")
-HTTP.WebSockets.listen("0.0.0.0", 8080) do ws
-    ws_handler(ws)
+const sim_state = SimulationState(nothing, Dict())
+
+function handle_websocket(ws)
+    println("WebSocket client connected")
+    
+    while !eof(ws)
+        try
+            msg = String(readavailable(ws))
+            if isempty(msg)
+                continue
+            end
+            
+            data = JSON3.read(msg)
+            
+            if data.type == "INIT"
+                # Initialize solver
+                sim_state.solver = HeatSolver(
+                    nx=50, ny=50,
+                    diffusivity=get(data, :diffusivity, 0.1),
+                    dt=get(data, :timeStep, 0.01)
+                )
+                
+                response = JSON3.write(Dict(
+                    "type" => "STATUS",
+                    "message" => "Solver initialized"
+                ))
+                write(ws, response)
+                
+            elseif data.type == "STEP"
+                # Run one timestep
+                if !isnothing(sim_state.solver)
+                    t = time()
+                    solution = step!(sim_state.solver)
+                    solve_time = (time() - t) * 1000  # ms
+                    
+                    # Convert to grid for visualization
+                    grid = to_grid(solution, 50, 50)
+                    
+                    response = JSON3.write(Dict(
+                        "type" => "SOLUTION_UPDATE",
+                        "data" => Dict(
+                            "values" => vec(grid),
+                            "solveTime" => solve_time
+                        )
+                    ))
+                    write(ws, response)
+                end
+                
+            elseif data.type == "UPDATE_PARAMS"
+                # Update parameters
+                if haskey(data, :diffusivity)
+                    sim_state.params["diffusivity"] = data.diffusivity
+                end
+                
+            elseif data.type == "ADD_DISTURBANCE"
+                # Add heat source
+                if !isnothing(sim_state.solver)
+                    add_heat_source!(
+                        sim_state.solver,
+                        data.position.x,
+                        data.position.y,
+                        get(data, :magnitude, 1.0)
+                    )
+                end
+            end
+            
+        catch e
+            @warn "WebSocket error" exception=(e, catch_backtrace())
+            break
+        end
+    end
+    
+    println("WebSocket client disconnected")
+end
+
+function start_server(port=8000)
+    @info "Starting PhysicsForge backend on port $port"
+    
+    HTTP.listen("0.0.0.0", port) do http
+        if HTTP.WebSockets.is_upgrade(http.message)
+            HTTP.WebSockets.upgrade(http) do ws
+                handle_websocket(ws)
+            end
+        else
+            HTTP.setstatus(http, 404)
+            HTTP.startwrite(http)
+            write(http, "PhysicsForge WebSocket Server")
+        end
+    end
 end
